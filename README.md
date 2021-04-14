@@ -1,4 +1,4 @@
-Using cub with pytorch.
+Using cub with pytorch. Need CUDA 11.x to be able to work.
 
 To build the code, run the following commands from your terminal:
 
