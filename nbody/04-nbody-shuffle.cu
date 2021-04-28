@@ -5,6 +5,8 @@
 #include <stdlib.h>
 
 #define SOFTENING 1e-9f
+#define BLOCK_SIZE 32
+#define BLOCK_STRIDE 32
 
 /*
  * Each body contains x, y, and z coordinate positions,
@@ -21,28 +23,51 @@ typedef struct {
  */
 
 __global__ void bodyForce(Body *p, float dt, int n) {
-  int i = threadIdx.x + blockDim.x * blockIdx.x;
+
+  // int i = threadIdx.x + blockIdx.x * blockDim.x;
+  int cycle_times = n / BLOCK_SIZE;
+  // 计算要处理的数据index
+  int i = threadIdx.x + (int)(blockIdx.x / BLOCK_STRIDE) * blockDim.x;
+  // 此块对应要处理的数据块的起始位置
+  int start_block = blockIdx.x % BLOCK_STRIDE;
   if (i < n) {
+    Body ptemp = p[i];
+    Body temp;
+    float share_x, share_y, share_z;
+    float dx, dy, dz, distSqr, invDist, invDist3;
     float Fx = 0.0f;
     float Fy = 0.0f;
     float Fz = 0.0f;
-
-    for (int j = 0; j < n; j++) {
-      float dx = p[j].x - p[i].x;
-      float dy = p[j].y - p[i].y;
-      float dz = p[j].z - p[i].z;
-      float distSqr = dx * dx + dy * dy + dz * dz + SOFTENING;
-      float invDist = rsqrtf(distSqr);
-      float invDist3 = invDist * invDist * invDist;
-
-      Fx += dx * invDist3;
-      Fy += dy * invDist3;
-      Fz += dz * invDist3;
+    // 这里的cycle_times 在已知块大小时使用常数性能会高一些
+    for (int block_num = start_block; block_num < cycle_times;
+         block_num += BLOCK_STRIDE) {
+      temp = p[block_num * BLOCK_SIZE + threadIdx.x];
+      share_x = temp.x;
+      share_y = temp.y;
+      share_z = temp.z;
+      // 编译优化，只有 BLOCK_SIZE 为常量时才有用
+#pragma unroll
+      for (int j = 0; j < BLOCK_SIZE; j++) {
+        dx = __shfl_sync(0xFFFFFFFF, share_x, j) - ptemp.x;
+        dy = __shfl_sync(0xFFFFFFFF, share_y, j) - ptemp.y;
+        dz = __shfl_sync(0xFFFFFFFF, share_z, j) - ptemp.z;
+        distSqr = dx * dx + dy * dy + dz * dz + SOFTENING;
+        invDist = rsqrtf(distSqr);
+        invDist3 = invDist * invDist * invDist;
+        Fx += dx * invDist3;
+        Fy += dy * invDist3;
+        Fz += dz * invDist3;
+      }
+      // 块内同步，防止spos提前被写入
+      __syncthreads();
     }
-
-    p[i].vx += dt * Fx;
-    p[i].vy += dt * Fy;
-    p[i].vz += dt * Fz;
+    // 块之间不同步，原子加保证正确性
+    atomicAdd(&p[i].vx, dt * Fx);
+    atomicAdd(&p[i].vy, dt * Fy);
+    atomicAdd(&p[i].vz, dt * Fz);
+    // p[i].vx += dt * Fx;
+    // p[i].vy += dt * Fy;
+    // p[i].vz += dt * Fz;
   }
 }
 
@@ -123,7 +148,7 @@ int main(const int argc, const char **argv) {
      * and potentially the work to integrate the positions.
      */
     cudaDeviceSynchronize();
-    bodyForce<<<nblocks, threads_per_block>>>(p, dt, nBodies);
+    bodyForce<<<nblocks * BLOCK_STRIDE, threads_per_block>>>(p, dt, nBodies);
 
     /*
      * This position integration cannot occur until this round of `bodyForce`
