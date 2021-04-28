@@ -20,20 +20,17 @@ typedef struct {
  * on all others.
  */
 
-__global__ void bodyForce(Body *bodies, float dt, int n) {
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
-  int stride = gridDim.x * blockDim.x;
-
-  for (; i < n; i += stride) {
+__global__ void bodyForce(Body *p, float dt, int n) {
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  if (i < n) {
     float Fx = 0.0f;
     float Fy = 0.0f;
     float Fz = 0.0f;
-    Body bodyI = bodies[i];
 
     for (int j = 0; j < n; j++) {
-      float dx = bodies[j].x - bodyI.x;
-      float dy = bodies[j].y - bodyI.y;
-      float dz = bodies[j].z - bodyI.z;
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
       float distSqr = dx * dx + dy * dy + dz * dz + SOFTENING;
       float invDist = rsqrtf(distSqr);
       float invDist3 = invDist * invDist * invDist;
@@ -43,20 +40,18 @@ __global__ void bodyForce(Body *bodies, float dt, int n) {
       Fz += dz * invDist3;
     }
 
-    bodies[i].vx += dt * Fx;
-    bodies[i].vy += dt * Fy;
-    bodies[i].vz += dt * Fz;
+    p[i].vx += dt * Fx;
+    p[i].vy += dt * Fy;
+    p[i].vz += dt * Fz;
   }
 }
 
-__global__ void integratePos(Body *bodies, float dt, int n) {
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
-  int stride = gridDim.x * blockDim.x;
-
-  for (; i < n; i += stride) {
-    bodies[i].x += bodies[i].vx * dt;
-    bodies[i].y += bodies[i].vy * dt;
-    bodies[i].z += bodies[i].vz * dt;
+__global__ void integratePos(Body *p, float dt, int n) {
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  if (i < n) {
+    p[i].x += p[i].vx * dt;
+    p[i].y += p[i].vy * dt;
+    p[i].z += p[i].vz * dt;
   }
 }
 
@@ -100,10 +95,10 @@ int main(const int argc, const char **argv) {
   cudaGetDevice(&deviceId);
   cudaGetDeviceProperties(&props, deviceId);
 
-  dim3 blocks(props.multiProcessorCount * 32); // 80*32
-  dim3 threads_per_block(props.warpSize * 8);  // 256
+  dim3 threads_per_block(props.warpSize * 1);
+  int nblocks = (nBodies + threads_per_block.x - 1) / threads_per_block.x;
 
-  printf("blocks %d, SMs: %d, threads_per_block %d\n", blocks.x,
+  printf("blocks %d, SMs: %d, threads_per_block %d\n", nblocks,
          props.multiProcessorCount, threads_per_block.x);
 
   cudaMallocManaged(&buf, bytes);
@@ -128,7 +123,7 @@ int main(const int argc, const char **argv) {
      * and potentially the work to integrate the positions.
      */
     cudaDeviceSynchronize();
-    bodyForce<<<blocks, threads_per_block>>>(p, dt, nBodies);
+    bodyForce<<<nblocks, threads_per_block>>>(p, dt, nBodies);
 
     /*
      * This position integration cannot occur until this round of `bodyForce`
@@ -136,7 +131,7 @@ int main(const int argc, const char **argv) {
      * integration is complete.
      */
 
-    integratePos<<<blocks, threads_per_block>>>(p, dt, nBodies);
+    integratePos<<<nblocks, threads_per_block>>>(p, dt, nBodies);
     cudaDeviceSynchronize();
 
     const double tElapsed = GetTimer() / 1000.0;
