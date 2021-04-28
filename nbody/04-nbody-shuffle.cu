@@ -20,8 +20,9 @@ typedef struct {
  * on all others.
  */
 
-void bodyForce(Body *p, float dt, int n) {
-  for (int i = 0; i < n; ++i) {
+__global__ void bodyForce(Body *p, float dt, int n) {
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  if (i < n) {
     float Fx = 0.0f;
     float Fy = 0.0f;
     float Fz = 0.0f;
@@ -42,6 +43,15 @@ void bodyForce(Body *p, float dt, int n) {
     p[i].vx += dt * Fx;
     p[i].vy += dt * Fy;
     p[i].vz += dt * Fz;
+  }
+}
+
+__global__ void integratePos(Body *p, float dt, int n) {
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  if (i < n) {
+    p[i].x += p[i].vx * dt;
+    p[i].y += p[i].vy * dt;
+    p[i].z += p[i].vz * dt;
   }
 }
 
@@ -79,11 +89,24 @@ int main(const int argc, const char **argv) {
   int bytes = nBodies * sizeof(Body);
   float *buf;
 
-  buf = (float *)malloc(bytes);
+  int deviceId;
+  cudaDeviceProp props;
 
+  cudaGetDevice(&deviceId);
+  cudaGetDeviceProperties(&props, deviceId);
+
+  dim3 threads_per_block(props.warpSize * 1);
+  int nblocks = (nBodies + threads_per_block.x - 1) / threads_per_block.x;
+
+  printf("blocks %d, SMs: %d, threads_per_block %d\n", nblocks,
+         props.multiProcessorCount, threads_per_block.x);
+
+  cudaMallocManaged(&buf, bytes);
   Body *p = (Body *)buf;
 
+  cudaMemPrefetchAsync(buf, bytes, cudaCpuDeviceId);
   read_values_from_file(initialized_values, buf, bytes);
+  cudaMemPrefetchAsync(buf, bytes, deviceId);
 
   double totalTime = 0.0;
 
@@ -99,8 +122,8 @@ int main(const int argc, const char **argv) {
      * You will likely wish to refactor the work being done in `bodyForce`,
      * and potentially the work to integrate the positions.
      */
-
-    bodyForce(p, dt, nBodies); // compute interbody forces
+    cudaDeviceSynchronize();
+    bodyForce<<<nblocks, threads_per_block>>>(p, dt, nBodies);
 
     /*
      * This position integration cannot occur until this round of `bodyForce`
@@ -108,11 +131,8 @@ int main(const int argc, const char **argv) {
      * integration is complete.
      */
 
-    for (int i = 0; i < nBodies; i++) { // integrate position
-      p[i].x += p[i].vx * dt;
-      p[i].y += p[i].vy * dt;
-      p[i].z += p[i].vz * dt;
-    }
+    integratePos<<<nblocks, threads_per_block>>>(p, dt, nBodies);
+    cudaDeviceSynchronize();
 
     const double tElapsed = GetTimer() / 1000.0;
     totalTime += tElapsed;
@@ -127,5 +147,5 @@ int main(const int argc, const char **argv) {
   // might result in unrealistically high values.
   printf("%0.3f Billion Interactions / second\n", billionsOfOpsPerSecond);
 
-  free(buf);
+  cudaFree(buf);
 }
