@@ -19,30 +19,71 @@ typedef struct {
  * Calculate the gravitational impact of all bodies in the system
  * on all others.
  */
+template <int BLOCKX, int BLOCKY>
+__global__ void bodyForce(Body *bodies, float dt, int n) {
+  constexpr int BLOCK_SIZE = BLOCKX * BLOCKY;
+  __shared__ float3 spos[BLOCK_SIZE];
+  int i = blockIdx.x * blockDim.y + threadIdx.y;
+  int tIdx = threadIdx.y * blockDim.x + threadIdx.x;
+  int num_tiles = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-void bodyForce(Body *p, float dt, int n) {
-  for (int i = 0; i < n; ++i) {
-    float Fx = 0.0f;
-    float Fy = 0.0f;
-    float Fz = 0.0f;
+  float Fx = 0.0f;
+  float Fy = 0.0f;
+  float Fz = 0.0f;
+  Body bodyI;
+  if (i < n)
+    bodyI = bodies[i];
 
-    for (int j = 0; j < n; j++) {
-      float dx = p[j].x - p[i].x;
-      float dy = p[j].y - p[i].y;
-      float dz = p[j].z - p[i].z;
-      float distSqr = dx * dx + dy * dy + dz * dz + SOFTENING;
-      float invDist = rsqrtf(distSqr);
-      float invDist3 = invDist * invDist * invDist;
-
-      Fx += dx * invDist3;
-      Fy += dy * invDist3;
-      Fz += dz * invDist3;
+  for (int tileIdx = 0; tileIdx < num_tiles; tileIdx++) {
+    // preload j to smem
+    int j = BLOCK_SIZE * tileIdx + tIdx;
+    if (j < n) {
+      Body posj = bodies[j];
+      spos[tIdx] = make_float3(posj.x, posj.y, posj.z);
     }
+    __syncthreads();
 
-    p[i].vx += dt * Fx;
-    p[i].vy += dt * Fy;
-    p[i].vz += dt * Fz;
+    // calculation
+    for (int jj = threadIdx.x; jj < BLOCK_SIZE && i < n; jj += blockDim.x) {
+      int j = jj + BLOCK_SIZE * tileIdx;
+      if (j < n) {
+        float dx = spos[jj].x - bodyI.x;
+        float dy = spos[jj].y - bodyI.y;
+        float dz = spos[jj].z - bodyI.z;
+        float distSqr = dx * dx + dy * dy + dz * dz + SOFTENING;
+        float invDist = rsqrtf(distSqr);
+        float invDist3 = invDist * invDist * invDist;
+
+        Fx += dx * invDist3;
+        Fy += dy * invDist3;
+        Fz += dz * invDist3;
+      }
+    }
+    __syncthreads();
   }
+
+  if (i < n) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+      Fx += __shfl_down_sync(0xFFFFFFFF, Fx, offset);
+      Fy += __shfl_down_sync(0xFFFFFFFF, Fy, offset);
+      Fz += __shfl_down_sync(0xFFFFFFFF, Fz, offset);
+    }
+    if (threadIdx.x == 0) {
+      bodies[i].vx += dt * Fx;
+      bodies[i].vy += dt * Fy;
+      bodies[i].vz += dt * Fz;
+    }
+  }
+}
+
+__global__ void integratePos(Body *bodies, float dt, int n) {
+  int i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= n)
+    return;
+  // printf("cuda %d %f \n", i, bodies[i].vx);
+  bodies[i].x += bodies[i].vx * dt;
+  bodies[i].y += bodies[i].vy * dt;
+  bodies[i].z += bodies[i].vz * dt;
 }
 
 int main(const int argc, const char **argv) {
@@ -79,11 +120,15 @@ int main(const int argc, const char **argv) {
   int bytes = nBodies * sizeof(Body);
   float *buf;
 
-  buf = (float *)malloc(bytes);
+  int deviceId;
+  cudaGetDevice(&deviceId);
 
+  cudaMallocManaged(&buf, bytes);
   Body *p = (Body *)buf;
 
+  cudaMemPrefetchAsync(buf, bytes, cudaCpuDeviceId);
   read_values_from_file(initialized_values, buf, bytes);
+  cudaMemPrefetchAsync(buf, bytes, deviceId);
 
   double totalTime = 0.0;
 
@@ -99,8 +144,10 @@ int main(const int argc, const char **argv) {
      * You will likely wish to refactor the work being done in `bodyForce`,
      * and potentially the work to integrate the positions.
      */
-
-    bodyForce(p, dt, nBodies); // compute interbody forces
+    constexpr int iPerblock = 16;
+    dim3 block(32, iPerblock);
+    int nblocks = (nBodies + iPerblock - 1) / iPerblock;
+    bodyForce<32, iPerblock><<<nblocks, block>>>(p, dt, nBodies);
 
     /*
      * This position integration cannot occur until this round of `bodyForce`
@@ -108,11 +155,10 @@ int main(const int argc, const char **argv) {
      * integration is complete.
      */
 
-    for (int i = 0; i < nBodies; i++) { // integrate position
-      p[i].x += p[i].vx * dt;
-      p[i].y += p[i].vy * dt;
-      p[i].z += p[i].vz * dt;
-    }
+    int blocksize = 128;
+    nblocks = (nBodies + blocksize - 1) / blocksize;
+    integratePos<<<nblocks, blocksize>>>(p, dt, nBodies);
+    cudaDeviceSynchronize();
 
     const double tElapsed = GetTimer() / 1000.0;
     totalTime += tElapsed;
@@ -125,7 +171,7 @@ int main(const int argc, const char **argv) {
   // You will likely enjoy watching this value grow as you accelerate the
   // application, but beware that a failure to correctly synchronize the device
   // might result in unrealistically high values.
-  printf("%0.3f Billion Interactions / second", billionsOfOpsPerSecond);
+  printf("%0.3f Billion Interactions / second\n", billionsOfOpsPerSecond);
 
-  free(buf);
+  cudaFree(buf);
 }

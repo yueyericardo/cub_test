@@ -125,7 +125,7 @@ int main(const int argc, const char **argv) {
   // You will likely enjoy watching this value grow as you accelerate the
   // application, but beware that a failure to correctly synchronize the device
   // might result in unrealistically high values.
-  printf("%0.3f Billion Interactions / second", billionsOfOpsPerSecond);
+  printf("%0.3f Billion Interactions / second\n", billionsOfOpsPerSecond);
 
   free(buf);
 }
